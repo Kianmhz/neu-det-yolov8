@@ -11,7 +11,8 @@ Variants (a missing file is skipped and noted, e.g. if TensorRT failed):
 
 For each variant:
   1. Accuracy: Ultralytics validation on the TEST split (270 images never used for training or for
-     choosing best.pt), batch 1 -> mAP50, mAP50-95, per-class AP, plus Ultralytics' own per-image
+     choosing best.pt), batch 1, rect=False so every format sees the same 640x640 input
+     -> mAP50, mAP50-95, per-class AP, plus Ultralytics' own per-image
      preprocess / inference / postprocess times.
   2. Latency: one fixed 1x3x640x640 input, warm-up passes, then timed passes with a CUDA sync
      after each -> median and p95 of the model forward pass alone (no pre/post-processing).
@@ -66,6 +67,10 @@ def evaluate(path: Path, quantize, label: str, args: argparse.Namespace) -> dict
         batch=1,
         device=0,
         quantize=quantize,
+        # Same input for every format. model.val() defaults to rect=True, and validation pads with
+        # pad=0.5, so a .pt model sees a 672x672 canvas (640 px image + 16 px grey border) while
+        # fixed-shape ONNX/TensorRT files are forced to rect=False and see exactly 640x640.
+        rect=False,
         plots=label == "PyTorch FP32",  # confusion matrix and PR curves on the test set, once
         verbose=False,
         project=str(Path("runs/benchmark").resolve()),
