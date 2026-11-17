@@ -41,10 +41,33 @@ def main() -> None:
         except ImportError:
             print(f"{name:<12} not installed")
             continue
-        line = f"{name:<12} {getattr(mod, '__version__', '?')}"
+        print(f"{name:<12} {getattr(mod, '__version__', '?')}")
         if name == "onnxruntime":
-            line += f"  providers={mod.get_available_providers()}"
-        print(line)
+            print(f"  ort session  {ort_cuda_session_providers(mod)}")
+        if name == "tensorrt":
+            mod.Builder(mod.Logger(mod.Logger.ERROR))  # loads libnvinfer and initialises CUDA
+            print("  trt builder  ok")
+
+
+def ort_cuda_session_providers(ort) -> list[str]:
+    """Providers a real session ends up with. get_available_providers() only lists what was
+    compiled in; if the CUDA libraries fail to load, a session silently falls back to CPU."""
+    from onnx import TensorProto, helper
+
+    # CUDA 13 pip wheels put their .so files in site-packages/nvidia/cu13/lib, which is not on the
+    # loader path. `import torch` loads the libraries torch needs, but not libcurand, which the ORT
+    # CUDA provider also needs. Without this call the session silently runs on CPU.
+    # Ultralytics makes the same call before creating its ONNX session (nn/backends/onnx.py).
+    if hasattr(ort, "preload_dlls"):
+        ort.preload_dlls()
+
+    io = [helper.make_tensor_value_info(n, TensorProto.FLOAT, [1]) for n in ("x", "y")]
+    graph = helper.make_graph([helper.make_node("Identity", ["x"], ["y"])], "t", io[:1], io[1:])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=9)
+    session = ort.InferenceSession(
+        model.SerializeToString(), providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+    )
+    return session.get_providers()  # want CUDAExecutionProvider first
 
 
 if __name__ == "__main__":
