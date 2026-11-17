@@ -1,0 +1,12 @@
+# Exact versions used for the results in README.md
+# (Ubuntu 24.04 on WSL2, Python 3.12.3, NVIDIA driver 620.70 / CUDA 13 pip wheels).
+# Run `python scripts/check_env.py` afterwards: it fails loudly if PyTorch is a CPU-only build
+# or if ONNX Runtime cannot use the GPU.
+torch==2.15.0
+torchvision==0.29.2
+ultralytics==8.4.215
+onnx==1.23.2
+onnxslim==0.1.99
+onnxruntime-gpu[cuda]==1.32.0
+tensorrt-cu13==10.16.1.11
+gdown==6.5.1
