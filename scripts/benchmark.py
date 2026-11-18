@@ -1,28 +1,37 @@
 """Benchmark accuracy and latency of the fine-tuned model in PyTorch, ONNX Runtime and TensorRT.
 
 Usage (repo root, venv active, nothing else using the GPU):
-    python scripts/benchmark.py
+    python scripts/benchmark.py                                  # writes results/benchmark.{json,md}
+    python scripts/benchmark.py --out results/run3_int8_672      # keep a separate run
 
-Variants (a missing file is skipped and noted, e.g. if TensorRT failed):
-    PyTorch FP32        best.pt
-    PyTorch FP16        best.pt with quantize=16
-    ONNX Runtime FP32   best.onnx on the CUDA execution provider
-    TensorRT FP16       best.engine
+Variants (a missing file is skipped and noted, e.g. if TensorRT or a tagged export is absent):
+    PyTorch FP32               best.pt, 640x640
+    PyTorch FP32 640+border    best.pt, 640 px image on a 672x672 canvas (Ultralytics' default .pt val)
+    PyTorch FP16               best.pt with quantize=16, 640x640
+    ONNX Runtime FP32          best.onnx on the CUDA execution provider, 640x640
+    TensorRT FP16              best.engine, 640x640
+    TensorRT INT8              best_int8.engine, 640x640 (scripts/export.py --int8 --tag int8)
+    TensorRT FP16 672          best_672.engine, image enlarged to 672x672 (scripts/export.py --imgsz 672 --tag 672)
 
 For each variant:
   1. Accuracy: Ultralytics validation on the TEST split (270 images never used for training or for
-     choosing best.pt), batch 1, rect=False so every format sees the same 640x640 input
-     -> mAP50, mAP50-95, per-class AP, plus Ultralytics' own per-image
+     choosing best.pt), batch 1 -> mAP50, mAP50-95, per-class AP, plus Ultralytics' own per-image
      preprocess / inference / postprocess times.
-  2. Latency: one fixed 1x3x640x640 input, warm-up passes, then timed passes with a CUDA sync
-     after each -> median and p95 of the model forward pass alone (no pre/post-processing).
-     Ultralytics validation warms up with a single pass, so its averages can include slow first runs.
+     rect=False everywhere except the "+border" variant: model.val() defaults to rect=True and pads
+     with pad=0.5, so a .pt model would otherwise see a 672x672 canvas (640 px image + 16 px grey
+     border) while fixed-shape ONNX/TensorRT files see exactly their export size.
+  2. Latency: one fixed input of the size the network actually processes, warm-up passes, then timed
+     passes with a CUDA sync after each -> median and p95 of the model forward pass alone (no
+     pre/post-processing). Ultralytics validation warms up with a single pass, so its averages can
+     include slow first runs.
 
-Writes results/benchmark.json (everything) and results/benchmark.md (tables for the README).
+Writes <out>/benchmark.json (everything) and <out>/benchmark.md (tables for the README).
 """
 import argparse
 import json
+import math
 import platform
+import re
 import statistics
 import time
 from datetime import datetime
@@ -34,12 +43,16 @@ import ultralytics
 from ultralytics import YOLO
 from ultralytics.nn.autobackend import AutoBackend
 
-VARIANTS = [  # (label, file name, quantize passed to val / AutoBackend)
-    ("PyTorch FP32", "best.pt", None),
-    ("PyTorch FP16", "best.pt", 16),
-    ("ONNX Runtime FP32", "best.onnx", None),
-    ("TensorRT FP16", "best.engine", None),  # precision is baked into the engine at build time
+VARIANTS = [  # (label, file name, quantize passed to val / AutoBackend, imgsz, rect)
+    ("PyTorch FP32", "best.pt", None, 640, False),
+    ("PyTorch FP32 640+border", "best.pt", None, 640, True),
+    ("PyTorch FP16", "best.pt", 16, 640, False),
+    ("ONNX Runtime FP32", "best.onnx", None, 640, False),
+    ("TensorRT FP16", "best.engine", None, 640, False),  # precision is baked into each engine
+    ("TensorRT INT8", "best_int8.engine", None, 640, False),
+    ("TensorRT FP16 672", "best_672.engine", None, 672, False),
 ]
+STRIDE = 32
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,7 +60,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weights-dir", type=Path, default=Path("runs/yolov8s_640/weights"))
     p.add_argument("--data", type=Path, default=Path("data/neu-det-yolo/data.yaml"))
     p.add_argument("--split", default="test")
-    p.add_argument("--imgsz", type=int, default=640)
     p.add_argument("--warmup", type=int, default=50, help="untimed forward passes before timing")
     p.add_argument("--runs", type=int, default=500, help="timed forward passes")
     p.add_argument("--out", type=Path, default=Path("results"))
@@ -55,22 +67,29 @@ def parse_args() -> argparse.Namespace:
 
 
 def slug(label: str) -> str:
-    return label.lower().replace(" ", "_")
+    return re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
 
 
-def evaluate(path: Path, quantize, label: str, args: argparse.Namespace) -> dict:
-    """mAP and per-class AP on the test split, one image at a time."""
+def network_input(imgsz: int, rect: bool) -> int:
+    """Side length the network actually processes. Validation with rect=True pads with pad=0.5."""
+    return math.ceil(imgsz / STRIDE + 0.5) * STRIDE if rect else imgsz
+
+
+def input_desc(imgsz: int, rect: bool) -> str:
+    n = network_input(imgsz, rect)
+    return f"{imgsz} + {(n - imgsz) // 2} px border = {n}" if rect else str(imgsz)
+
+
+def evaluate(path: Path, quantize, label: str, imgsz: int, rect: bool, args: argparse.Namespace) -> dict:
+    """mAP and per-class AP on the chosen split, one image at a time."""
     m = YOLO(str(path), task="detect").val(
         data=str(args.data.resolve()),
         split=args.split,
-        imgsz=args.imgsz,
+        imgsz=imgsz,
         batch=1,
         device=0,
         quantize=quantize,
-        # Same input for every format. model.val() defaults to rect=True, and validation pads with
-        # pad=0.5, so a .pt model sees a 672x672 canvas (640 px image + 16 px grey border) while
-        # fixed-shape ONNX/TensorRT files are forced to rect=False and see exactly 640x640.
-        rect=False,
+        rect=rect,
         plots=label == "PyTorch FP32",  # confusion matrix and PR curves on the test set, once
         verbose=False,
         project=str(Path("runs/benchmark").resolve()),
@@ -93,11 +112,11 @@ def evaluate(path: Path, quantize, label: str, args: argparse.Namespace) -> dict
 
 
 @torch.inference_mode()
-def time_forward(path: Path, quantize, args: argparse.Namespace) -> dict:
-    """Latency of the forward pass alone on a fixed input."""
+def time_forward(path: Path, quantize, size: int, args: argparse.Namespace) -> dict:
+    """Latency of the forward pass alone on a fixed size x size input."""
     backend = AutoBackend(model=str(path), device=torch.device("cuda:0"), fp16=quantize == 16, verbose=False)
     dtype = torch.half if backend.fp16 else torch.float  # the engine/ONNX file decides its own input type
-    im = torch.rand(1, 3, args.imgsz, args.imgsz, device=backend.device, dtype=dtype)
+    im = torch.rand(1, 3, size, size, device=backend.device, dtype=dtype)
 
     for _ in range(args.warmup):
         backend(im)
@@ -115,6 +134,7 @@ def time_forward(path: Path, quantize, args: argparse.Namespace) -> dict:
         "p95": float(np.percentile(times, 95)),
         "mean": statistics.fmean(times),
         "min": min(times),
+        "input_size": size,
         "warmup": args.warmup,
         "runs": args.runs,
         "input_dtype": str(dtype).replace("torch.", ""),
@@ -146,25 +166,26 @@ def markdown(res: dict) -> str:
     out = [
         f"Generated by `scripts/benchmark.py` on {env['date']}. {env['gpu']}, torch {env['torch']} "
         f"(CUDA {env['cuda']}), Ultralytics {env['ultralytics']}, ONNX Runtime {env['onnxruntime']}, "
-        f"TensorRT {env['tensorrt']}. Test split ({res['split']}), batch 1, {res['imgsz']} px. "
-        f"Forward latency: median and p95 of {res['runs']} timed passes after {res['warmup']} warm-up passes.",
+        f"TensorRT {env['tensorrt']}. Split: {res['split']}, batch 1. Forward latency: median and p95 of "
+        f"{res['runs']} timed passes after {res['warmup']} warm-up passes, at the input size the network processes.",
         "",
-        "| Variant | File (MB) | mAP50 | mAP50-95 | Forward median (ms) | Forward p95 (ms) | Speed-up vs PyTorch FP32 "
-        "| Ultralytics val pre / inf / post (ms/img) |",
-        "|---|---|---|---|---|---|---|---|",
+        "| Variant | Input (px) | File (MB) | mAP50 | mAP50-95 | Forward median (ms) | Forward p95 (ms) "
+        "| Speed-up vs PyTorch FP32 | Ultralytics val pre / inf / post (ms/img) |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for label, r in rows.items():
         if "skipped" in r:
-            out.append(f"| {label} | – | – | – | – | – | – | {r['skipped']} |")
+            out.append(f"| {label} | – | – | – | – | – | – | – | {r['skipped']} |")
             continue
         lat, sp = r["latency_ms"], r["val_speed_ms_per_image"]
         speedup = f"{base / lat['median']:.2f}x" if base else "–"
         out.append(
-            f"| {label} | {r['size_mb']:.1f} | {r['map50']:.3f} | {r['map50_95']:.3f} | {lat['median']:.2f} "
-            f"| {lat['p95']:.2f} | {speedup} | {sp['preprocess']:.2f} / {sp['inference']:.2f} / {sp['postprocess']:.2f} |"
+            f"| {label} | {r['input']} | {r['size_mb']:.1f} | {r['map50']:.3f} | {r['map50_95']:.3f} "
+            f"| {lat['median']:.2f} | {lat['p95']:.2f} | {speedup} "
+            f"| {sp['preprocess']:.2f} / {sp['inference']:.2f} / {sp['postprocess']:.2f} |"
         )
     classes = next(iter(ran.values()))["per_class"].keys() if ran else []
-    out += ["", "Per-class AP50 / AP50-95 on the test split:", "",
+    out += ["", f"Per-class AP50 / AP50-95 on the {res['split']} split:", "",
             "| Class | " + " | ".join(ran) + " |", "|---|" + "---|" * len(ran)]
     for c in classes:
         cells = [f"{r['per_class'][c]['ap50']:.3f} / {r['per_class'][c]['ap50_95']:.3f}" for r in ran.values()]
@@ -174,24 +195,24 @@ def markdown(res: dict) -> str:
 
 def main() -> None:
     args = parse_args()
-    res = {"env": versions(), "split": args.split, "imgsz": args.imgsz,
-           "warmup": args.warmup, "runs": args.runs, "variants": {}}
+    res = {"env": versions(), "split": args.split, "warmup": args.warmup, "runs": args.runs, "variants": {}}
 
-    for label, fname, quantize in VARIANTS:
+    for label, fname, quantize, imgsz, rect in VARIANTS:
         path = args.weights_dir / fname
         if not path.is_file():
             print(f"\n=== {label}: SKIPPED, {path} not found")
             res["variants"][label] = {"skipped": f"{fname} not found"}
             continue
-        print(f"\n=== {label}: {path}")
-        acc = evaluate(path, quantize, label, args)
-        lat = time_forward(path, quantize, args)
-        res["variants"][label] = {"file": str(path), "size_mb": path.stat().st_size / 2**20, **acc, "latency_ms": lat}
+        print(f"\n=== {label}: {path} (input {input_desc(imgsz, rect)})")
+        acc = evaluate(path, quantize, label, imgsz, rect, args)
+        lat = time_forward(path, quantize, network_input(imgsz, rect), args)
+        res["variants"][label] = {"file": str(path), "imgsz": imgsz, "rect": rect, "input": input_desc(imgsz, rect),
+                                  "size_mb": path.stat().st_size / 2**20, **acc, "latency_ms": lat}
         print(f"    mAP50 {acc['map50']:.3f}  mAP50-95 {acc['map50_95']:.3f}  "
               f"forward median {lat['median']:.2f} ms  p95 {lat['p95']:.2f} ms"
               + (f"  providers {lat['onnxruntime_providers']}" if lat["onnxruntime_providers"] else ""))
 
-    args.out.mkdir(exist_ok=True)
+    args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "benchmark.json").write_text(json.dumps(res, indent=2) + "\n")
     md = markdown(res)
     (args.out / "benchmark.md").write_text(md)

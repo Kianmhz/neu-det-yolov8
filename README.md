@@ -15,8 +15,10 @@ the machine described under [Environment](#environment). Results files are in [`
 | Split | Stratified by class: 1,260 train / 270 val / 270 test (210 / 45 / 45 per class), seed 0 |
 | Model | YOLOv8s (11.1 M parameters, 28.4 GFLOPs at 640 px), fine-tuned from COCO weights, 100 epochs |
 | Test accuracy | **mAP50 0.738, mAP50-95 0.411** (identical within 0.001 for PyTorch, ONNX Runtime and TensorRT) |
-| Model latency, batch 1 | PyTorch 3.0–3.2 ms · ONNX Runtime 2.5–2.9 ms · **TensorRT FP16 0.63–0.66 ms** (median, two runs) |
+| Model latency, batch 1 | PyTorch 3.0–3.2 ms · ONNX Runtime 2.5–2.9 ms · **TensorRT FP16 0.63–0.68 ms** (median, three runs) |
 | Speed-up | TensorRT FP16 is **4.5–5.0×** faster than PyTorch for the model alone, **2.4×** per image end to end |
+| INT8 experiment | TensorRT INT8: 0.46 ms, 1.5× faster than FP16, for mAP50 0.717 / mAP50-95 0.391 (−0.02 each) |
+| Input-size experiment | A 16 px grey border around the 640 px image raised test mAP50 to 0.775; enlarging the image to 672 px did not (0.731) |
 
 ## Results
 
@@ -36,16 +38,16 @@ each.
 ¹ "FP32" means FP32 storage. PyTorch 2.15 runs FP32 convolutions in TF32 on tensor cores by default
 (`torch.backends.cudnn.conv.fp32_precision == "tf32"`), so this is not a strict-FP32 baseline.
 
-**Latency varies between runs.** The forward-latency loop always uses a fixed 640×640 input, so the first
-benchmark run ([`results/run1_default_val/`](results/run1_default_val/)) is a second valid latency
-measurement:
+**Latency varies between runs.** The forward-latency loop always uses a fixed 640×640 input for these
+formats, so the first and third benchmark runs ([`results/run1_default_val/`](results/run1_default_val/),
+[`results/run3_int8_672/`](results/run3_int8_672/)) are further valid latency measurements:
 
-| Format | Run 1 median / p95 (ms) | Run 2 median / p95 (ms) | Speed-up range |
-|---|---|---|---|
-| PyTorch FP32 | 3.20 / 4.14 | 3.01 / 3.83 | 1× |
-| PyTorch FP16 | 3.19 / 4.03 | 3.36 / 4.58 | 0.89–1.00× |
-| ONNX Runtime FP32 | 2.48 / 2.92 | 2.93 / 3.53 | 1.03–1.29× |
-| TensorRT FP16 | 0.63 / 0.67 | 0.66 / 0.71 | 4.52–5.04× |
+| Format | Run 1 median / p95 (ms) | Run 2 median / p95 (ms) | Run 3 median / p95 (ms) | Speed-up range |
+|---|---|---|---|---|
+| PyTorch FP32 | 3.20 / 4.14 | 3.01 / 3.83 | 3.06 / 4.05 | 1× |
+| PyTorch FP16 | 3.19 / 4.03 | 3.36 / 4.58 | 3.37 / 4.44 | 0.89–1.00× |
+| ONNX Runtime FP32 | 2.48 / 2.92 | 2.93 / 3.53 | 2.63 / 3.09 | 1.03–1.29× |
+| TensorRT FP16 | 0.63 / 0.67 | 0.66 / 0.71 | 0.68 / 0.74 | 4.47–5.04× |
 
 What I take from this:
 
@@ -56,9 +58,9 @@ What I take from this:
   PyTorch launches each layer's GPU kernels one at a time from Python, and faster maths does not shorten
   that. TensorRT fuses layers into far fewer kernels and launches the whole network with one call. I have
   not profiled this, so it is a hypothesis (see [Next steps](#next-steps)).
-- **ONNX Runtime and PyTorch are within run-to-run noise of each other** (1.03× in one run, 1.29× in the
-  other). Only the TensorRT gain is clearly larger than the noise.
-- **TensorRT is also the most consistent** (p95 within 0.05 ms of the median). The runtimes that do more
+- **ONNX Runtime and PyTorch are within run-to-run noise of each other** (1.03–1.29× across three runs).
+  Only the TensorRT gain is clearly larger than the noise.
+- **TensorRT is also the most consistent** (p95 within 0.06 ms of the median). The runtimes that do more
   CPU work per image vary more; the GPU is shared with the Windows desktop under WSL2.
 
 ### End to end per image: Amdahl's law
@@ -134,6 +136,71 @@ FP16 predictions at confidence ≥ 0.25.*
 - **Box-count imbalance is not the main driver.** Pitted surface has the fewest boxes (432 in the whole
   dataset, against 1,011 for inclusion) but is mid-table. Every class has exactly 300 images.
 
+## Experiments: INT8 and input size
+
+A follow-up run with two more TensorRT engines, all variants benchmarked together on the test split
+([`results/run3_int8_672/benchmark.md`](results/run3_int8_672/benchmark.md)):
+
+```bash
+python scripts/export.py --formats engine --int8 --tag int8      # best_int8.engine
+python scripts/export.py --formats engine --imgsz 672 --tag 672  # best_672.engine
+python scripts/benchmark.py --out results/run3_int8_672
+```
+
+| Variant | Network input | File (MB) | mAP50 | mAP50-95 | Forward median / p95 (ms) | End to end per image (ms) ³ |
+|---|---|---|---|---|---|---|
+| PyTorch FP32 (reference) | 640 | 21.5 | 0.738 | 0.411 | 3.06 / 4.05 | 4.55 |
+| PyTorch FP32, 640 + 16 px border | 672 (640 image + border) | 21.5 | 0.775 | 0.450 | 3.09 / 3.97 | 4.81 |
+| TensorRT FP16 | 640 | 24.1 | 0.738 | 0.411 | 0.68 / 0.74 | 1.86 |
+| TensorRT INT8 | 640 | 12.2 | 0.717 | 0.391 | 0.46 / 0.50 | 1.65 |
+| TensorRT FP16 672 | 672 (image enlarged) | 23.9 | 0.731 | 0.411 | 0.74 / 0.80 | 1.99 |
+
+³ Ultralytics preprocess + inference + postprocess, averaged over the 270 test images.
+
+### INT8
+
+- **How.** TensorRT 10 INT8 with MinMax calibration on the 1,260 training images, so val and test images
+  were never used. FP16 stays enabled and TensorRT picks INT8 or FP16 per layer by speed; for accuracy,
+  Ultralytics keeps the head's Sigmoid in FP32 and its output and DFL convolutions in FP16.
+- **Result.** The engine is half the size (12.2 vs 24.1 MB) and the model is 1.48× faster than FP16
+  (0.46 vs 0.68 ms in the same run). Accuracy dropped by 0.021 mAP50 (0.738 → 0.717) and 0.020 mAP50-95
+  (0.411 → 0.391).
+- **Where the loss is.** Mostly inclusion (AP50 0.788 → 0.720, AP50-95 0.416 → 0.353) and rolled-in scale
+  (AP50 0.655 → 0.594). The other classes moved by at most 0.024 AP50, some up, which is within noise.
+  Inclusions are small, thin defects; losing fine detail first fits that, but I have not verified it.
+- **End to end it is only 1.13× faster** (1.86 → 1.65 ms per image): with INT8, preprocessing and NMS are
+  about 71% of the time per image.
+- **Verdict for this GPU:** not worth it. INT8 saves about 0.2 ms per image and costs 2 points of mAP, and
+  7 points of AP50 on inclusion. On an edge device where the network dominates the time per frame the
+  trade could be different, and it would need measuring there. Entropy calibration or quantization-aware
+  training might recover some of the accuracy.
+
+### Input size: border or enlargement?
+
+Ultralytics' default `.pt` validation feeds the 640 px image on a 672×672 canvas with a 16 px grey border,
+and that scored higher (see [What went wrong](#what-went-wrong-and-how-i-fixed-it), item 2). Is it the
+larger input or the border? Same model, three ways of feeding it:
+
+| Input | mAP50 | mAP50-95 |
+|---|---|---|
+| 640 px image, no border | 0.738 | 0.411 |
+| 640 px image + 16 px grey border (672 canvas) | **0.775** | **0.450** |
+| image enlarged to 672 px, no border | 0.731 | 0.411 |
+
+- **Enlarging did not help; the border did.** The gain is largest for crazing (AP50 0.355 → 0.437) and
+  pitted surface (0.788 → 0.861). In the prediction grid, those classes' labelled regions are often large
+  and reach the image edge.
+- **Two possible explanations, neither tested.** With a border, a defect that runs off the image has a
+  visible edge where its box should stop. And mosaic augmentation put training images on grey canvases for
+  90 of the 100 epochs, so bordered images may simply be closer to what the model saw in training.
+- **Cost.** The bordered input is 672×672, about 10% more pixels. The 672 engine shows what that costs in
+  TensorRT: 0.74 vs 0.68 ms for the model, 1.99 vs 1.86 ms end to end.
+- **Caveats.** This was found on the test set, so the test set is no longer a clean hold-out for this
+  question. `best.pt` was also chosen by validation run with the border, which may favour it. And 270
+  images is small. Before deploying "pad by 16 px" it needs confirming on new data, and then a 672 engine
+  fed with a padded 640 image (custom preprocessing: validating a fixed 672 engine in Ultralytics enlarges
+  the image instead).
+
 ## What went wrong and how I fixed it
 
 1. **ONNX Runtime silently fell back to the CPU.** Creating a session with the CUDA execution provider
@@ -152,8 +219,8 @@ FP16 predictions at confidence ≥ 0.25.*
    rectangular batches with `pad=0.5`, so a `.pt` model saw a 672×672 canvas (the 640 px image plus a
    16 px grey border), while fixed-shape ONNX and TensorRT models are forced to `rect=False` and see
    exactly 640×640. With `rect=False` for every format, all four agree. This is train/serve skew: the
-   model being measured received different preprocessing from the model being deployed. Side finding,
-   not explained yet: the padded 672 input scored higher.
+   model being measured received different preprocessing from the model being deployed. Side finding:
+   the padded input scored higher, which I followed up in [Experiments](#experiments-int8-and-input-size).
 
 3. **The default confusion matrix was misleading.** Ultralytics validates at confidence 0.001 so the
    precision–recall curve covers every threshold, and it builds the confusion matrix at that same 0.001.
@@ -184,7 +251,9 @@ FP16 predictions at confidence ≥ 0.25.*
   benchmark runs, batch 1 only, Python pre/post-processing. The TensorRT engine is only valid on this GPU
   model with TensorRT 10.16.
 - **Input size.** The 200×200 images are upscaled 3.2× to 640×640 (Ultralytics default) and the grey
-  image is copied into 3 channels to match the COCO-pretrained first layer. I did not test other sizes.
+  image is copied into 3 channels to match the COCO-pretrained first layer. Only 640 and 672 were tested.
+- **INT8 used one calibration method.** MinMax only, on training images, with TensorRT 10's implicit
+  quantization (deprecated in favour of explicit Q/DQ in TensorRT 11).
 - **Weight decay barely did anything.** With AdamW at lr 0.001, the default `weight_decay=0.0005`
   (tuned for SGD) shrinks weights by at most about 0.1% over the run.
 - I did not check ONNX Runtime's TF32 setting, so its "FP32" row may also use TF32 convolutions.
@@ -193,13 +262,15 @@ FP16 predictions at confidence ≥ 0.25.*
 
 - **Measure what the line needs.** Add image-level "defect flagged / not flagged" metrics and per-class
   thresholds, and test on defect-free steel.
-- **672 vs 640 input.** Export at 672 to find out whether the padded border's higher mAP holds up.
+- **Confirm the border effect** on new data (another split or cross-validation), check whether it comes
+  from boxes that touch the image edge, and if it holds, deploy a 672 engine fed with a padded 640 image.
 - **Smaller input for latency.** Train at 224 or 256 px (closer to the native 200 px) and compare mAP
   against latency.
 - **Pre/post-processing.** NMS inside the engine (Ultralytics `nms=True` export) and GPU preprocessing.
 - **Test the overhead hypothesis.** Profile PyTorch, try larger batches, CUDA Graphs or `torch.compile`,
   and a strict-FP32 baseline.
-- **INT8 TensorRT** with calibration on training images, and TensorRT 11 with ModelOpt.
+- **Better INT8.** Entropy calibration instead of MinMax, quantization-aware training (Ultralytics 8.4
+  supports `quantize=8` during training), and TensorRT 11 with ModelOpt's explicit quantization.
 - **Edge hardware.** Rebuild and benchmark the engine on a Jetson.
 - **More reliable numbers.** Several seeds or cross-validation; try larger AdamW weight decay, vertical
   flips (plausible for steel), and segmentation masks for the texture classes.
@@ -238,7 +309,8 @@ scripts/export.py           ONNX (FP32) and TensorRT (FP16) export
 scripts/benchmark.py        test-split mAP, per-class AP and latency for all formats
 scripts/make_figures.py     README figures
 splits/                     train / val / test file lists
-results/                    benchmark outputs (second run, plus the first run in run1_default_val/)
+results/                    benchmark outputs: second run, first run (run1_default_val/),
+                            INT8 and input-size experiments (run3_int8_672/)
 assets/                     figures used in this README
 ```
 
